@@ -36,7 +36,7 @@ When it is time to take a medicine, HydraMedi:
 
 ## Workflow Diagram
 
-![HydraMedi Workflow](diagram/hydramedi diagram.png)
+![HydraMedi Workflow](diagram/hydramedi-diagram.png)
 
 ---
 
