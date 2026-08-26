@@ -31,13 +31,18 @@ const char* FIREBASE_URL = "https://hydramedi-default-rtdb.firebaseio.com";
 
 #define PIN_BUZZER 14
 #define PIN_BUTTON 13
+#define PIN_POWER_BUTTON 16   // Project ON/OFF button (button to GND)
 #define PIN_SERVO1 18
 #define PIN_SERVO2 19
 #define PIN_SERVO3 23
 
-// New medicine timing LEDs
-#define PIN_LED_BEFORE 32
-#define PIN_LED_AFTER 33
+// Timing LEDs for 3 compartments (Yellow = BEFORE meal, Green = AFTER meal)
+#define PIN_LED_C1_BEFORE 32   // Compartment 1 (Morning)   - Before Meal
+#define PIN_LED_C1_AFTER  33   // Compartment 1 (Morning)   - After Meal
+#define PIN_LED_C2_BEFORE 12   // Compartment 2 (Afternoon) - Before Meal
+#define PIN_LED_C2_AFTER  15   // Compartment 2 (Afternoon) - After Meal
+#define PIN_LED_C3_BEFORE 2    // Compartment 3 (Night)     - Before Meal
+#define PIN_LED_C3_AFTER  17   // Compartment 3 (Night)     - After Meal
 
 // RGB LED TYPE
 #define RGB_COMMON_ANODE false
@@ -51,6 +56,7 @@ const char* FIREBASE_URL = "https://hydramedi-default-rtdb.firebaseio.com";
 #define WATER_DISPLAY_MS 250UL
 #define FIREBASE_SYNC_MS 20000UL
 #define DEBOUNCE_MS 200UL
+#define POWER_BUTTON_DEBOUNCE_MS 300UL
 
 // HX711 calibration - keep your existing value initially, then recalibrate
 #define HX711_CALIBRATION -5.214126f
@@ -127,6 +133,28 @@ bool oledOK = false;
 bool rtcOK = false;
 bool ntpTimeOK = false;
 
+enum FirebaseStatus {
+  FB_NOT_CHECKED,
+  FB_OK,
+  FB_EMPTY,
+  FB_ERROR
+};
+
+FirebaseStatus firebaseStatus = FB_NOT_CHECKED;
+int firebaseActiveCount = 0;
+String firebaseError = "";
+
+// -----------------------------------------------------------------------
+// ALARM DUPLICATE-PREVENTION
+// -----------------------------------------------------------------------
+// Firebase is still the ONLY source of the schedule. These keys are only
+// used to remember that a Firebase alarm at a particular date/time has
+// already been triggered. This prevents the same alarm from firing again
+// after the medicine/water flow returns to S_IDLE and Firebase is synced.
+String lastTriggeredKey[MAX_MEDS] = {"", "", ""};
+
+String makeAlarmKey(int idx, const Med& m, const DateTime& d);
+
 // Timers
 unsigned long tDisplay = 0;
 unsigned long tBuzzer = 0;
@@ -137,6 +165,17 @@ unsigned long tBtn = 0;
 
 bool buzzing = false;
 String lastDate = "";
+
+// -----------------------------------------------------------------------
+// PROJECT ON/OFF CONTROL
+// -----------------------------------------------------------------------
+// This is a SOFTWARE power switch. It does not remove electrical power
+// from the ESP32; it puts HydraMedi into a safe OFF state and disables
+// Firebase scheduling/actuators until the button is pressed again.
+bool projectEnabled = true;
+bool powerButtonLastState = HIGH;
+unsigned long tPowerButton = 0;
+unsigned long tPowerDisplay = 0;
 
 // -----------------------------------------------------------------------
 // WEIGHT SENSOR GLOBALS
@@ -217,9 +256,10 @@ void startWaterTracking() {
   resetWeightFilter();
 }
 
-// Read exactly ONE ready HX711 conversion. No 5-sample blocking average.
+// Read exactly ONE ready HX711 conversion with zero-delay guard.
+// If load cell is disconnected/unready, returns immediately without blocking loop.
 void updateWeightSensor() {
-  if (!scale.is_ready()) return;
+  if (digitalRead(PIN_HX_DAT) != LOW) return;
 
   float r = scale.get_units(1);
   if (!isfinite(r)) return;
@@ -319,13 +359,18 @@ void updateBottleLiftState() {
 // NOTE: This function still sends servo pulses synchronously for ~300ms.
 // It is acceptable for this project flow, but it is not strictly non-blocking.
 void servoWrite(int pin, int deg) {
+  pinMode(pin, OUTPUT);
+
   if (pin == 23) {
     SPI.end();
     delay(5);
   }
 
   int us = map(constrain(deg, 0, 180), 0, 180, 500, 2400);
-  for (int i = 0; i < 15; i++) {
+  Serial.printf("[SERVO] Motor Pin GPIO %d -> %d deg (%d us pulse)\n", pin, deg, us);
+
+  // 40 pulses * 20ms = 800ms total window so servos reliably reach target angle
+  for (int i = 0; i < 40; i++) {
     digitalWrite(pin, HIGH);
     delayMicroseconds(us);
     digitalWrite(pin, LOW);
@@ -335,11 +380,13 @@ void servoWrite(int pin, int deg) {
 
 void openComp(int c) {
   int p = (c == 1) ? PIN_SERVO1 : (c == 2) ? PIN_SERVO2 : PIN_SERVO3;
+  Serial.printf("[SERVO] Opening Compartment %d (GPIO %d)\n", c, p);
   servoWrite(p, 90);
 }
 
 void closeComp(int c) {
   int p = (c == 1) ? PIN_SERVO1 : (c == 2) ? PIN_SERVO2 : PIN_SERVO3;
+  Serial.printf("[SERVO] Closing Compartment %d (GPIO %d)\n", c, p);
   servoWrite(p, 0);
 }
 
@@ -381,20 +428,40 @@ void rgbOff() {
 }
 
 // -----------------------------------------------------------------------
-// BEFORE / AFTER MEAL LEDS
+// BEFORE / AFTER MEAL LEDS (6 LEDs: 2 per compartment)
 // -----------------------------------------------------------------------
 void timingLEDsOff() {
-  digitalWrite(PIN_LED_BEFORE, LOW);
-  digitalWrite(PIN_LED_AFTER, LOW);
+  digitalWrite(PIN_LED_C1_BEFORE, LOW);
+  digitalWrite(PIN_LED_C1_AFTER,  LOW);
+  digitalWrite(PIN_LED_C2_BEFORE, LOW);
+  digitalWrite(PIN_LED_C2_AFTER,  LOW);
+  digitalWrite(PIN_LED_C3_BEFORE, LOW);
+  digitalWrite(PIN_LED_C3_AFTER,  LOW);
 }
 
 void showMealTimingLED(const Med& m) {
+  timingLEDsOff();
+
   String s = String(m.mealTiming);
   s.trim();
   s.toUpperCase();
+  bool isBefore = (s == "BEFORE");
 
-  digitalWrite(PIN_LED_BEFORE, (s == "BEFORE") ? HIGH : LOW);
-  digitalWrite(PIN_LED_AFTER, (s == "AFTER") ? HIGH : LOW);
+  uint8_t c = (m.comp >= 1 && m.comp <= 3) ? m.comp : 1;
+
+  Serial.printf("[LED] showMealTimingLED: Compartment %d | Timing %s | Before=%s\n",
+                c, isBefore ? "BEFORE" : "AFTER", isBefore ? "YES" : "NO");
+
+  if (c == 1) {
+    digitalWrite(PIN_LED_C1_BEFORE, isBefore ? HIGH : LOW);
+    digitalWrite(PIN_LED_C1_AFTER,  !isBefore ? HIGH : LOW);
+  } else if (c == 2) {
+    digitalWrite(PIN_LED_C2_BEFORE, isBefore ? HIGH : LOW);
+    digitalWrite(PIN_LED_C2_AFTER,  !isBefore ? HIGH : LOW);
+  } else if (c == 3) {
+    digitalWrite(PIN_LED_C3_BEFORE, isBefore ? HIGH : LOW);
+    digitalWrite(PIN_LED_C3_AFTER,  !isBefore ? HIGH : LOW);
+  }
 }
 
 // -----------------------------------------------------------------------
@@ -483,6 +550,14 @@ String fmtTime(const DateTime& d) {
   return String(b);
 }
 
+String makeAlarmKey(int idx, const Med& m, const DateTime& d) {
+  // Include medicine identity + date + exact Firebase time.
+  // If Firebase changes the schedule to another minute, it becomes a new event.
+  return String(idx) + "|" + String(m.comp) + "|" +
+         String(m.name) + "|" + fmtDate(d) + "|" +
+         String(m.hr) + ":" + String(m.mn);
+}
+
 // -----------------------------------------------------------------------
 // OLED SCREENS
 // -----------------------------------------------------------------------
@@ -497,7 +572,6 @@ void screenIdle() {
   oled.print("HydraMedi");
   oled.drawLine(0, 10, 128, 10, SSD1306_WHITE);
 
-  // 12-hour local time, e.g. 09:31 PM
   int hour12 = d.hour() % 12;
   if (hour12 == 0) hour12 = 12;
   const char* ampm = (d.hour() >= 12) ? "PM" : "AM";
@@ -509,14 +583,117 @@ void screenIdle() {
   oled.setCursor(94, 20);
   oled.print(ampm);
 
-  oled.setTextSize(1);
   oled.setCursor(20, 34);
   oled.printf("%04d-%02d-%02d", d.year(), d.month(), d.day());
 
   oled.drawLine(0, 46, 128, 46, SSD1306_WHITE);
   oled.setCursor(0, 52);
-  oled.print(WiFi.isConnected() ? "WiFi:OK  USB Pwr" : "WiFi:-- USB Pwr");
+
+  if (firebaseStatus == FB_ERROR) {
+    oled.print("FB: ERROR - CHECK DATA");
+  } else if (firebaseStatus == FB_EMPTY) {
+    oled.print("FB: NO SCHEDULE");
+  } else if (firebaseStatus == FB_OK) {
+    oled.printf("FB: OK  %d SCHEDULE%s", firebaseActiveCount,
+                firebaseActiveCount == 1 ? "" : "S");
+  } else {
+    oled.print("FB: WAITING...");
+  }
+
   oled.display();
+}
+
+void screenFirebaseError() {
+  if (!oledOK) return;
+
+  oled.clearDisplay();
+  oled.setTextColor(SSD1306_WHITE);
+  oled.setTextSize(1);
+  oled.setCursor(17, 0);
+  oled.print("FIREBASE ERROR");
+  oled.drawLine(0, 10, 128, 10, SSD1306_WHITE);
+
+  oled.setCursor(0, 18);
+  oled.print("Schedule read failed.");
+  oled.setCursor(0, 29);
+  oled.print("No new schedule used.");
+  oled.setCursor(0, 40);
+  oled.print("Check WiFi/Firebase.");
+  oled.setCursor(0, 52);
+  oled.print("System will retry.");
+  oled.display();
+}
+
+void screenProjectOff() {
+  if (!oledOK) return;
+
+  oled.clearDisplay();
+  oled.setTextColor(SSD1306_WHITE);
+  oled.setTextSize(2);
+  oled.setCursor(34, 8);
+  oled.print("OFF");
+  oled.setTextSize(1);
+  oled.setCursor(12, 32);
+  oled.print("HydraMedi stopped");
+  oled.setCursor(7, 46);
+  oled.print("Press Power button");
+  oled.setCursor(27, 56);
+  oled.print("to turn ON");
+  oled.display();
+}
+
+void forceProjectOutputsOff() {
+  digitalWrite(PIN_BUZZER, LOW);
+  buzzing = false;
+  rgbOff();
+  timingLEDsOff();
+}
+
+void handlePowerButton() {
+  bool current = digitalRead(PIN_POWER_BUTTON);
+
+  // Detect a new press (HIGH -> LOW), not a held button.
+  if (current == LOW && powerButtonLastState == HIGH &&
+      millis() - tPowerButton >= POWER_BUTTON_DEBOUNCE_MS) {
+
+    tPowerButton = millis();
+    projectEnabled = !projectEnabled;
+
+    if (!projectEnabled) {
+      Serial.println("[POWER] PROJECT OFF - all alarms, Firebase schedule checks, and actuators disabled.");
+
+      forceProjectOutputsOff();
+      if (activeIdx >= 0 && activeIdx < MAX_MEDS) {
+        closeComp(meds[activeIdx].comp);
+      }
+      state = S_IDLE;
+      activeIdx = -1;
+      baseWeight = 0.0f;
+      displayWeight = 0.0f;
+      bottleLifted = false;
+      bottleWasLifted = false;
+      tDisplay = 0;
+      tLiveSync = millis();
+    } else {
+      Serial.println("[POWER] PROJECT ON - requesting a fresh Firebase schedule sync.");
+
+      forceProjectOutputsOff();
+      state = S_IDLE;
+      activeIdx = -1;
+      tDisplay = 0;
+      tSync = millis();
+
+      // Clear the status until the fresh Firebase read finishes.
+      firebaseStatus = FB_NOT_CHECKED;
+      firebaseError = "";
+      firebaseActiveCount = 0;
+
+      // Firebase is authoritative: immediately try to reload it.
+      syncFB();
+    }
+  }
+
+  powerButtonLastState = current;
 }
 
 void screenMed(const Med& m) {
@@ -607,13 +784,27 @@ void screenMsg(const char* msg) {
 // -----------------------------------------------------------------------
 // FIREBASE
 // -----------------------------------------------------------------------
+// -----------------------------------------------------------------------
+// FIREBASE URL HELPER
+// -----------------------------------------------------------------------
+String getFbUrl(const String& path) {
+  String base = String(FIREBASE_URL);
+  base.trim();
+  while (base.endsWith("/")) {
+    base.remove(base.length() - 1);
+  }
+  if (path.startsWith("/")) return base + path;
+  return base + "/" + path;
+}
+
 void fbPost(const String& path, const String& json) {
   if (!WiFi.isConnected()) return;
 
   WiFiClientSecure cli;
   cli.setInsecure();
   HTTPClient http;
-  http.begin(cli, String(FIREBASE_URL) + "/" + path + ".json");
+  http.setFollowRedirects(HTTPC_STRICT_FOLLOW_REDIRECTS);
+  http.begin(cli, getFbUrl(path + ".json"));
   http.addHeader("Content-Type", "application/json");
   int code = http.POST(json);
   Serial.printf("[FB] POST %s -> HTTP %d\n", path.c_str(), code);
@@ -630,31 +821,50 @@ void logEvent(const char* event, const char* med, float wml) {
 }
 
 // -----------------------------------------------------------------------
-// SIMPLE JSON HELPERS
+// ROBUST JSON HELPERS (Handles spaces around colons & quotes)
 // -----------------------------------------------------------------------
+static String getJsonRawValue(const String& src, const char* key) {
+  String k = String("\"") + key + "\"";
+  int keyPos = src.indexOf(k);
+  if (keyPos < 0) return "";
+
+  int colonPos = src.indexOf(':', keyPos + k.length());
+  if (colonPos < 0) return "";
+
+  int start = colonPos + 1;
+  while (start < (int)src.length() && (src[start] == ' ' || src[start] == '\t' || src[start] == '\r' || src[start] == '\n')) {
+    start++;
+  }
+  if (start >= (int)src.length()) return "";
+  return src.substring(start);
+}
+
 static String jsonStr(const String& src, const char* key) {
-  String k = String("\"") + key + "\":\"";
-  int i = src.indexOf(k);
-  if (i < 0) return "";
-  i += k.length();
-  int j = src.indexOf('"', i);
-  if (j < 0) return "";
-  return src.substring(i, j);
+  String val = getJsonRawValue(src, key);
+  if (val.length() == 0) return "";
+
+  if (val[0] == '"') {
+    int endQuote = val.indexOf('"', 1);
+    if (endQuote >= 0) return val.substring(1, endQuote);
+  }
+  return "";
 }
 
 static int jsonInt(const String& src, const char* key, int def = 0) {
-  String k = String("\"") + key + "\":";
-  int i = src.indexOf(k);
-  if (i < 0) return def;
-  return src.substring(i + k.length()).toInt();
+  String val = getJsonRawValue(src, key);
+  if (val.length() == 0) return def;
+
+  if (val[0] == '"') val = val.substring(1);
+  return val.toInt();
 }
 
 static bool jsonBool(const String& src, const char* key, bool def = true) {
-  String k = String("\"") + key + "\":";
-  int i = src.indexOf(k);
-  if (i < 0) return def;
-  String v = src.substring(i + k.length(), i + k.length() + 5);
-  return !v.startsWith("false");
+  String val = getJsonRawValue(src, key);
+  if (val.length() == 0) return def;
+  val.trim();
+  val.toLowerCase();
+  if (val.startsWith("false") || val.startsWith("\"false\"") || val.startsWith("0")) return false;
+  return true;
 }
 
 void copyText(char* dst, size_t dstSize, const String& src) {
@@ -663,78 +873,326 @@ void copyText(char* dst, size_t dstSize, const String& src) {
   dst[dstSize - 1] = '\0';
 }
 
-void parseOneMed(const String& obj, int idx) {
-  if (idx < 0 || idx >= MAX_MEDS) return;
+// Extract a complete JSON object {...} starting from searchPos in body
+String extractJsonObject(const String& body, int bracePos) {
+  if (bracePos < 0 || bracePos >= (int)body.length() || body[bracePos] != '{') return "";
+
+  int depth = 0;
+  int objEnd = -1;
+
+  for (int i = bracePos; i < (int)body.length(); i++) {
+    if (body[i] == '{') depth++;
+    else if (body[i] == '}') {
+      depth--;
+      if (depth == 0) { objEnd = i; break; }
+    }
+  }
+  if (objEnd < 0) return "";
+  return body.substring(bracePos, objEnd + 1);
+}
+
+void clearAllSchedules() {
+  for (int i = 0; i < MAX_MEDS; i++) {
+    memset(&meds[i], 0, sizeof(Med));
+    meds[i].comp = i + 1;
+    meds[i].active = false;
+    meds[i].takenToday = false;
+  }
+  firebaseActiveCount = 0;
+}
+
+bool hasJsonKey(const String& src, const char* key) {
+  String k = String("\"") + key + "\"";
+  return src.indexOf(k) >= 0;
+}
+
+int daysInMonth(int year, int month) {
+  if (month < 1 || month > 12) return 0;
+  static const uint8_t days[] = {31,28,31,30,31,30,31,31,30,31,30,31};
+  if (month == 2) {
+    bool leap = (year % 4 == 0 && year % 100 != 0) || (year % 400 == 0);
+    return leap ? 29 : 28;
+  }
+  return days[month - 1];
+}
+
+bool validScheduleDate(int year, int month, int day) {
+  return year >= 2025 && year <= 2099 &&
+         month >= 1 && month <= 12 &&
+         day >= 1 && day <= daysInMonth(year, month);
+}
+
+bool parseOneMed(const String& obj, int idx) {
+  if (idx < 0 || idx >= MAX_MEDS) return false;
+
+  // Required Firebase fields. Missing fields are an invalid schedule,
+  // not an instruction to invent a default value.
+  const char* required[] = {
+    "name", "compartment", "color", "mealTiming",
+    "reminderHour", "reminderMin",
+    "startYear", "startMonth", "startDate",
+    "durationDays", "requiredWaterMl", "active"
+  };
+  for (const char* key : required) {
+    if (!hasJsonKey(obj, key)) {
+      Serial.printf("[FB] Invalid schedule %d: missing field '%s'\n", idx + 1, key);
+      return false;
+    }
+  }
 
   String n = jsonStr(obj, "name");
-  if (n.length() == 0) n = "Med " + String(idx + 1);
-  copyText(meds[idx].name, sizeof(meds[idx].name), n);
-
   String c = jsonStr(obj, "color");
-  if (c.length() == 0) c = "WHITE";
-  c.trim();
-  c.toUpperCase();
-  copyText(meds[idx].color, sizeof(meds[idx].color), c);
-
-  // Firebase field expected: mealTiming = "BEFORE" or "AFTER"
-  // Also accepts timing / mealRelation for convenience.
   String timing = jsonStr(obj, "mealTiming");
-  if (timing.length() == 0) timing = jsonStr(obj, "timing");
-  if (timing.length() == 0) timing = jsonStr(obj, "mealRelation");
-  timing.trim();
-  timing.toUpperCase();
-  if (timing != "BEFORE" && timing != "AFTER") timing = "BEFORE";
+  n.trim(); c.trim(); timing.trim();
+  c.toUpperCase(); timing.toUpperCase();
+
+  if (n.length() == 0 || c.length() == 0) {
+    Serial.printf("[FB] Invalid schedule %d: name/color is empty.\n", idx + 1);
+    return false;
+  }
+
+  if (timing != "BEFORE" && timing != "AFTER") {
+    Serial.printf("[FB] Invalid schedule %d: mealTiming='%s'. Use BEFORE or AFTER.\n",
+                  idx + 1, timing.c_str());
+    return false;
+  }
+
+  int comp = jsonInt(obj, "compartment", -1);
+  int h = jsonInt(obj, "reminderHour", -1);
+  int m = jsonInt(obj, "reminderMin", -1);
+  int year = jsonInt(obj, "startYear", -1);
+  int month = jsonInt(obj, "startMonth", -1);
+  int day = jsonInt(obj, "startDate", -1);
+  int duration = jsonInt(obj, "durationDays", -1);
+  int water = jsonInt(obj, "requiredWaterMl", -1);
+  bool active = jsonBool(obj, "active", false);
+
+  if (comp != idx + 1) {
+    Serial.printf("[FB] Invalid schedule %d: compartment=%d but expected %d.\n",
+                  idx + 1, comp, idx + 1);
+    return false;
+  }
+
+  if (h < 0 || h > 23 || m < 0 || m > 59) {
+    Serial.printf("[FB] Invalid schedule %d: bad time %02d:%02d.\n", idx + 1, h, m);
+    return false;
+  }
+
+  if (!validScheduleDate(year, month, day)) {
+    Serial.printf("[FB] Invalid schedule %d: bad start date %04d-%02d-%02d.\n",
+                  idx + 1, year, month, day);
+    return false;
+  }
+
+  if (duration <= 0 || duration > 3650) {
+    Serial.printf("[FB] Invalid schedule %d: durationDays=%d.\n", idx + 1, duration);
+    return false;
+  }
+
+  if (water <= 0 || water > 10000) {
+    Serial.printf("[FB] Invalid schedule %d: requiredWaterMl=%d.\n", idx + 1, water);
+    return false;
+  }
+
+  memset(&meds[idx], 0, sizeof(Med));
+  copyText(meds[idx].name, sizeof(meds[idx].name), n);
+  copyText(meds[idx].color, sizeof(meds[idx].color), c);
   copyText(meds[idx].mealTiming, sizeof(meds[idx].mealTiming), timing);
 
-  meds[idx].comp = constrain(jsonInt(obj, "compartment", idx + 1), 1, 3);
-  meds[idx].hr = constrain(jsonInt(obj, "reminderHour", 8), 0, 23);
-  meds[idx].mn = constrain(jsonInt(obj, "reminderMin", 0), 0, 59);
-  meds[idx].yr = jsonInt(obj, "startYear", 2026);
-  meds[idx].mo = constrain(jsonInt(obj, "startMonth", 8), 1, 12);
-  meds[idx].dy = constrain(jsonInt(obj, "startDate", 6), 1, 31);
-  meds[idx].days = max(1, jsonInt(obj, "durationDays", 7));
-  meds[idx].waterMl = max(1, jsonInt(obj, "requiredWaterMl", 250));
-  meds[idx].active = jsonBool(obj, "active", true);
+  meds[idx].comp = comp;
+  meds[idx].hr = (uint8_t)h;
+  meds[idx].mn = (uint8_t)m;
+  meds[idx].yr = (uint16_t)year;
+  meds[idx].mo = (uint8_t)month;
+  meds[idx].dy = (uint8_t)day;
+  meds[idx].days = duration;
+  meds[idx].waterMl = water;
+  meds[idx].active = active;
+  meds[idx].takenToday = false;
 
-  Serial.printf("[PARSED] Med[%d] %s @ %02d:%02d Comp%d %s MEAL\n",
+  Serial.printf("[PARSED] Med[%d] %s @ %02d:%02d Comp%d %s MEAL | %04d-%02d-%02d for %d days | active=%d\n",
                 idx, meds[idx].name, meds[idx].hr, meds[idx].mn,
-                meds[idx].comp, meds[idx].mealTiming);
+                meds[idx].comp, meds[idx].mealTiming,
+                meds[idx].yr, meds[idx].mo, meds[idx].dy, meds[idx].days,
+                meds[idx].active);
+  return true;
+}
+
+bool scheduleIsValidToday(const Med& m, const DateTime& d) {
+  if (!m.active) return false;
+  if (m.days <= 0) return false;
+
+  DateTime start(m.yr, m.mo, m.dy, 0, 0, 0);
+  DateTime today(d.year(), d.month(), d.day(), 0, 0, 0);
+  if (today < start) return false;
+
+  TimeSpan elapsed = today - start;
+  return elapsed.days() < m.days;
+}
+
+bool fetchFirebaseSchedules() {
+  if (!WiFi.isConnected()) {
+    firebaseStatus = FB_ERROR;
+    firebaseError = "WiFi disconnected";
+    return false;
+  }
+
+  Serial.println("[FB] Syncing schedules from Firebase...");
+
+  Med oldMeds[MAX_MEDS];
+  memcpy(oldMeds, meds, sizeof(meds));
+
+  // Build the new schedule in an empty array. This prevents a deleted
+  // Firebase schedule from surviving accidentally in RAM. If the read
+  // fails, oldMeds is restored below.
+  clearAllSchedules();
+
+  bool networkError = false;
+  bool anyValid = false;
+
+  // First try the exact endpoints that match the user's Firebase structure:
+  // /schedules/1.json, /schedules/2.json, /schedules/3.json
+  for (int i = 1; i <= MAX_MEDS; i++) {
+    WiFiClientSecure cli;
+    cli.setInsecure();
+    HTTPClient http;
+    http.setFollowRedirects(HTTPC_STRICT_FOLLOW_REDIRECTS);
+    String url = getFbUrl("schedules/" + String(i) + ".json");
+
+    if (!http.begin(cli, url)) {
+      networkError = true;
+      Serial.printf("[FB] Could not begin request: %s\n", url.c_str());
+      continue;
+    }
+
+    http.setTimeout(5000);
+    int code = http.GET();
+
+    if (code == 200) {
+      String body = http.getString();
+      body.trim();
+
+      if (body == "null" || body.length() == 0) {
+        Serial.printf("[FB] schedules/%d is empty/null.\n", i);
+      } else if (body.startsWith("{")) {
+        if (parseOneMed(body, i - 1)) {
+          anyValid = true;
+        } else {
+          // Invalid data is a Firebase-data problem, not a reason to use defaults.
+          networkError = true;
+        }
+      } else {
+        Serial.printf("[FB] schedules/%d returned non-object data.\n", i);
+        networkError = true;
+      }
+    } else {
+      Serial.printf("[FB] schedules/%d -> HTTP %d (%s)\n", i, code, http.errorToString(code).c_str());
+      networkError = true;
+    }
+
+    http.end();
+  }
+
+  // If direct endpoints were unavailable, try the whole /schedules object.
+  // This also handles a Firebase structure where the direct child request fails.
+  if (networkError && !anyValid) {
+    WiFiClientSecure cli;
+    cli.setInsecure();
+    HTTPClient http;
+    http.setFollowRedirects(HTTPC_STRICT_FOLLOW_REDIRECTS);
+    String url = getFbUrl("schedules.json");
+
+    if (http.begin(cli, url)) {
+      http.setTimeout(6000);
+      int code = http.GET();
+
+      if (code == 200) {
+        String body = http.getString();
+        body.trim();
+
+        if (body == "null" || body.length() == 0) {
+          Serial.println("[FB] /schedules is empty/null.");
+          networkError = false;
+        } else if (body.startsWith("{")) {
+          networkError = false;
+          for (int i = 1; i <= MAX_MEDS; i++) {
+            String keyStr = String("\"") + i + "\":";
+            int keyPos = body.indexOf(keyStr);
+            if (keyPos < 0) continue;
+
+            int bracePos = body.indexOf('{', keyPos);
+            if (bracePos < 0) {
+              networkError = true;
+              continue;
+            }
+
+            String obj = extractJsonObject(body, bracePos);
+            if (obj.length() > 5) {
+              if (parseOneMed(obj, i - 1)) anyValid = true;
+              else networkError = true;
+            }
+          }
+        } else {
+          networkError = true;
+        }
+      } else {
+        networkError = true;
+        Serial.printf("[FB] /schedules -> HTTP %d\n", code);
+      }
+      http.end();
+    } else {
+      networkError = true;
+    }
+  }
+
+  if (networkError) {
+    // A failed read must NEVER create an invented schedule.
+    // Keep the last successfully received Firebase schedule if one exists.
+    memcpy(meds, oldMeds, sizeof(meds));
+    firebaseStatus = FB_ERROR;
+    firebaseError = "Could not read/validate Firebase schedules";
+    Serial.println("[FB] ERROR: keeping last known Firebase schedule; no defaults created.");
+    return false;
+  }
+
+  // Firebase was successfully read. Missing schedule slots remain cleared.
+  // Example: if only schedules/1 exists, schedules/2 and /3 stay inactive.
+  for (int i = 0; i < MAX_MEDS; i++) {
+    if (meds[i].name[0] != '\0' && meds[i].active) {
+      firebaseActiveCount++;
+    }
+  }
+
+  // Important: an entirely empty Firebase schedule is valid and means NO alarms.
+  if (anyValid) {
+    firebaseStatus = FB_OK;
+    firebaseError = "";
+    Serial.println("[FB] Firebase schedules loaded successfully.");
+  } else {
+    firebaseStatus = FB_EMPTY;
+    firebaseError = "No schedules in Firebase";
+    Serial.println("[FB] Firebase contains no schedules. All medicine alarms disabled.");
+  }
+
+  // Schedule persistence is deliberately NOT used as a source of truth on boot.
+  // Firebase remains the authoritative source.
+  Serial.println("==================================================");
+  for (int i = 0; i < MAX_MEDS; i++) {
+    if (meds[i].name[0] != '\0') {
+      Serial.printf("  Med[%d] %-20s -> %02d:%02d | %04d-%02d-%02d +%d days | Comp %d | %s | active=%d\n",
+                    i, meds[i].name, meds[i].hr, meds[i].mn,
+                    meds[i].yr, meds[i].mo, meds[i].dy, meds[i].days,
+                    meds[i].comp, meds[i].mealTiming, meds[i].active);
+    } else {
+      Serial.printf("  Med[%d] -> NOT SET IN FIREBASE\n", i);
+    }
+  }
+  Serial.println("==================================================");
+  return true;
 }
 
 void syncFB() {
-  if (!WiFi.isConnected()) return;
-
-  WiFiClientSecure cli;
-  cli.setInsecure();
-  HTTPClient http;
-  http.begin(cli, String(FIREBASE_URL) + "/schedules.json");
-
-  int code = http.GET();
-  if (code == 200) {
-    String body = http.getString();
-    Serial.println("[FB] Syncing Schedules...");
-
-    for (int i = 1; i <= MAX_MEDS; i++) {
-      int pos = body.indexOf("\"id\":" + String(i));
-      if (pos < 0) pos = body.indexOf("\"compartment\":" + String(i));
-      if (pos < 0) pos = body.indexOf(String("\"") + String(i) + "\":{");
-
-      if (pos >= 0) {
-        int s = body.lastIndexOf('{', pos);
-        int e = body.indexOf('}', pos);
-        if (s >= 0 && e >= 0) parseOneMed(body.substring(s, e + 1), i - 1);
-      }
-    }
-
-    prefs.begin("hm", false);
-    prefs.putBytes("meds", meds, sizeof(meds));
-    prefs.end();
-    Serial.println("[FB] Sync OK - Schedules Updated.");
-  } else {
-    Serial.printf("[FB] Schedule GET failed: HTTP %d\n", code);
-  }
-
-  http.end();
+  fetchFirebaseSchedules();
 }
 
 void syncLiveState() {
@@ -761,7 +1219,8 @@ void syncLiveState() {
   WiFiClientSecure cli;
   cli.setInsecure();
   HTTPClient http;
-  http.begin(cli, String(FIREBASE_URL) + "/LiveState.json");
+  http.setFollowRedirects(HTTPC_STRICT_FOLLOW_REDIRECTS);
+  http.begin(cli, getFbUrl("LiveState.json"));
   http.addHeader("Content-Type", "application/json");
   http.PUT(buf);
   http.end();
@@ -770,43 +1229,8 @@ void syncLiveState() {
 // -----------------------------------------------------------------------
 // DEFAULT SCHEDULE
 // -----------------------------------------------------------------------
-void defaultSchedule() {
-  DateTime d = nowLocal();
+// No local/default medicine schedule exists. Firebase is the only source of truth.
 
-  for (int i = 0; i < MAX_MEDS; i++) {
-    int offset = (i == 0) ? 1 : (i == 1) ? 5 : 10;
-    int tm = d.hour() * 60 + d.minute() + offset;
-
-    meds[i].hr = (tm / 60) % 24;
-    meds[i].mn = tm % 60;
-    meds[i].yr = d.year();
-    meds[i].mo = d.month();
-    meds[i].dy = d.day();
-    meds[i].days = 7;
-    meds[i].waterMl = 250;
-    meds[i].active = true;
-    meds[i].takenToday = false;
-    meds[i].comp = i + 1;
-  }
-
-  copyText(meds[0].name, sizeof(meds[0].name), "Paracetamol 500mg");
-  copyText(meds[0].color, sizeof(meds[0].color), "RED");
-  copyText(meds[0].mealTiming, sizeof(meds[0].mealTiming), "AFTER");
-
-  copyText(meds[1].name, sizeof(meds[1].name), "Vitamin C 1000mg");
-  copyText(meds[1].color, sizeof(meds[1].color), "GREEN");
-  copyText(meds[1].mealTiming, sizeof(meds[1].mealTiming), "AFTER");
-  meds[1].waterMl = 200;
-  meds[1].days = 30;
-
-  copyText(meds[2].name, sizeof(meds[2].name), "Omeprazole 20mg");
-  copyText(meds[2].color, sizeof(meds[2].color), "BLUE");
-  copyText(meds[2].mealTiming, sizeof(meds[2].mealTiming), "BEFORE");
-  meds[2].waterMl = 300;
-  meds[2].days = 14;
-
-  Serial.printf("[SCHED] Default: Med[0] -> %02d:%02d\n", meds[0].hr, meds[0].mn);
-}
 
 // -----------------------------------------------------------------------
 // SETUP
@@ -822,34 +1246,45 @@ void setup() {
   pinMode(PIN_RGB_B, OUTPUT);
   pinMode(PIN_BUZZER, OUTPUT);
   pinMode(PIN_BUTTON, INPUT_PULLUP);
+  pinMode(PIN_POWER_BUTTON, INPUT_PULLUP);
   pinMode(PIN_SERVO1, OUTPUT);
   pinMode(PIN_SERVO2, OUTPUT);
   pinMode(PIN_SERVO3, OUTPUT);
   pinMode(PIN_HX_CLK, OUTPUT);
 
-  pinMode(PIN_LED_BEFORE, OUTPUT);
-  pinMode(PIN_LED_AFTER, OUTPUT);
+  pinMode(PIN_LED_C1_BEFORE, OUTPUT);
+  pinMode(PIN_LED_C1_AFTER,  OUTPUT);
+  pinMode(PIN_LED_C2_BEFORE, OUTPUT);
+  pinMode(PIN_LED_C2_AFTER,  OUTPUT);
+  pinMode(PIN_LED_C3_BEFORE, OUTPUT);
+  pinMode(PIN_LED_C3_AFTER,  OUTPUT);
 
   digitalWrite(PIN_BUZZER, LOW);
-  digitalWrite(PIN_SERVO1, LOW);
-  digitalWrite(PIN_SERVO2, LOW);
-  digitalWrite(PIN_SERVO3, LOW);
   digitalWrite(PIN_HX_CLK, LOW);
+  
+  // Servo startup sweep test
+  Serial.println("[SERVO] Testing Servos 1, 2, 3...");
+  openComp(1); delay(400); closeComp(1); delay(200);
+  openComp(2); delay(400); closeComp(2); delay(200);
+  openComp(3); delay(400); closeComp(3); delay(200);
+
   timingLEDsOff();
   rgbOff();
 
   // RGB startup test
   Serial.printf("[RGB] Type: %s\n", RGB_COMMON_ANODE ? "COMMON ANODE" : "COMMON CATHODE");
-  rgb(1, 0, 0); delay(300);
-  rgb(0, 1, 0); delay(300);
-  rgb(0, 0, 1); delay(300);
+  rgb(1, 0, 0); delay(200);
+  rgb(0, 1, 0); delay(200);
+  rgb(0, 0, 1); delay(200);
   rgbOff();
 
-  // Timing LED startup test
-  digitalWrite(PIN_LED_BEFORE, HIGH); delay(250);
-  digitalWrite(PIN_LED_BEFORE, LOW);
-  digitalWrite(PIN_LED_AFTER, HIGH); delay(250);
-  digitalWrite(PIN_LED_AFTER, LOW);
+  // 6 Timing LEDs startup test
+  digitalWrite(PIN_LED_C1_BEFORE, HIGH); delay(100); digitalWrite(PIN_LED_C1_BEFORE, LOW);
+  digitalWrite(PIN_LED_C1_AFTER,  HIGH); delay(100); digitalWrite(PIN_LED_C1_AFTER,  LOW);
+  digitalWrite(PIN_LED_C2_BEFORE, HIGH); delay(100); digitalWrite(PIN_LED_C2_BEFORE, LOW);
+  digitalWrite(PIN_LED_C2_AFTER,  HIGH); delay(100); digitalWrite(PIN_LED_C2_AFTER,  LOW);
+  digitalWrite(PIN_LED_C3_BEFORE, HIGH); delay(100); digitalWrite(PIN_LED_C3_BEFORE, LOW);
+  digitalWrite(PIN_LED_C3_AFTER,  HIGH); delay(100); digitalWrite(PIN_LED_C3_AFTER,  LOW);
 
   // 2. I2C + OLED
   Wire.begin(PIN_SDA, PIN_SCL);
@@ -891,18 +1326,29 @@ void setup() {
     Serial.println("[WARN] DS3231 not found.");
   }
 
-  // 4. HX711
-  Serial.println("[INIT] HX711 begin...");
-  scale.begin(PIN_HX_DAT, PIN_HX_CLK);
-  scale.set_scale(HX711_CALIBRATION);
+  // 4. HX711 (Truly non-blocking startup check - prevents scale.begin() hang)
+  Serial.println("[INIT] Checking HX711 scale...");
+  pinMode(PIN_HX_CLK, OUTPUT);
+  digitalWrite(PIN_HX_CLK, LOW);
+  pinMode(PIN_HX_DAT, INPUT_PULLUP);
 
-  if (scale.wait_ready_timeout(1200)) {
-    Serial.println("[OK] HX711 ready. Taring...");
-    scale.tare(10);
+  bool hxHardwareDetected = false;
+  unsigned long startCheck = millis();
+  while (millis() - startCheck < 120UL) {
+    if (digitalRead(PIN_HX_DAT) == LOW) {
+      hxHardwareDetected = true;
+      break;
+    }
+    delay(5);
+  }
+
+  if (hxHardwareDetected) {
+    scale.begin(PIN_HX_DAT, PIN_HX_CLK);
+    scale.set_scale(HX711_CALIBRATION);
     resetWeightFilter();
-    Serial.println("[OK] HX711 tared.");
+    Serial.println("[OK] HX711 scale hardware detected and initialized.");
   } else {
-    Serial.println("[WARN] HX711 not ready (check wiring/power). Project continues.");
+    Serial.println("[WARN] HX711 scale not connected/ready. Operating without weight sensor dependency.");
   }
 
   // 5. WiFi
@@ -933,26 +1379,36 @@ void setup() {
   }
 
   // 6. Schedule
-  prefs.begin("hm", false);
-  prefs.clear();
-  prefs.end();
-
-  // Start with safe defaults so Firebase parse failure never leaves zeroed meds.
-  defaultSchedule();
+  // Start with NO schedule. There is deliberately no local/default time.
+  clearAllSchedules();
+  firebaseStatus = FB_NOT_CHECKED;
+  firebaseError = "";
 
   if (WiFi.isConnected()) {
     syncFB();
+  } else {
+    firebaseStatus = FB_ERROR;
+    firebaseError = "WiFi unavailable";
+    Serial.println("[FB] No WiFi. No medicine schedule will be used.");
   }
 
   Serial.printf("[OK] Setup complete! Local time: %s\n", fmtTime(nowLocal()).c_str());
   for (int i = 0; i < MAX_MEDS; i++) {
-    Serial.printf("  Med[%d] %-20s -> %02d:%02d active=%d %s MEAL\n",
-                  i, meds[i].name, meds[i].hr, meds[i].mn,
-                  meds[i].active, meds[i].mealTiming);
+    if (meds[i].name[0] != '\0') {
+      Serial.printf("  Med[%d] %-20s -> %02d:%02d active=%d %s MEAL\n",
+                    i, meds[i].name, meds[i].hr, meds[i].mn,
+                    meds[i].active, meds[i].mealTiming);
+    } else {
+      Serial.printf("  Med[%d] -> NOT SET\n", i);
+    }
   }
 
   timingLEDsOff();
-  screenIdle();
+  if (firebaseStatus == FB_ERROR) screenFirebaseError();
+  else screenIdle();
+
+  powerButtonLastState = digitalRead(PIN_POWER_BUTTON);
+  tPowerButton = millis();
 }
 
 // -----------------------------------------------------------------------
@@ -962,6 +1418,25 @@ void loop() {
   unsigned long ms = millis();
   DateTime d = nowLocal();
 
+  // Hardware ON/OFF button is checked first so it can stop an active
+  // reminder/water state immediately.
+  handlePowerButton();
+
+  if (!projectEnabled) {
+    forceProjectOutputsOff();
+    state = S_IDLE;
+    activeIdx = -1;
+
+    if (oledOK && ms - tPowerDisplay >= 500UL) {
+      tPowerDisplay = ms;
+      screenProjectOff();
+    }
+
+    // Do not fetch Firebase, push LiveState, or run medication logic while OFF.
+    delay(5);
+    return;
+  }
+
   // Always service HX711 whenever a conversion is ready.
   // One conversion only; no 5-sample blocking call.
   updateWeightSensor();
@@ -969,8 +1444,11 @@ void loop() {
   // Daily reset
   String today = fmtDate(d);
   if (today != lastDate && lastDate != "") {
-    for (int i = 0; i < MAX_MEDS; i++) meds[i].takenToday = false;
-    Serial.println("[RESET] Daily takenToday flags cleared.");
+    for (int i = 0; i < MAX_MEDS; i++) {
+      meds[i].takenToday = false;
+      lastTriggeredKey[i] = "";
+    }
+    Serial.println("[RESET] Daily takenToday flags and alarm trigger locks cleared.");
   }
   lastDate = today;
 
@@ -1004,8 +1482,10 @@ void loop() {
 
       if (ms - tDisplay >= DISPLAY_REFRESH_MS) {
         tDisplay = ms;
-        screenIdle();
-        Serial.printf("[CLK] %02d:%02d:%02d\n", d.hour(), d.minute(), d.second());
+        if (firebaseStatus == FB_ERROR) screenFirebaseError();
+        else screenIdle();
+        Serial.printf("[CLK] %02d:%02d:%02d | Firebase=%d\n",
+                      d.hour(), d.minute(), d.second(), (int)firebaseStatus);
       }
 
       if (ms - tSync >= FIREBASE_SYNC_MS) {
@@ -1013,15 +1493,25 @@ void loop() {
         syncFB();
       }
 
-      // Alarm check
-      for (int i = 0; i < MAX_MEDS; i++) {
-        Med& m = meds[i];
+      // Alarm check: ONLY schedules currently accepted from Firebase can trigger.
+      // Date/duration is enforced here as well.
+      if (firebaseStatus == FB_OK || firebaseStatus == FB_EMPTY) {
+        for (int i = 0; i < MAX_MEDS; i++) {
+          Med& m = meds[i];
 
-        if (m.active && !m.takenToday &&
-            d.hour() == m.hr && d.minute() == m.mn) {
+          String alarmKey = makeAlarmKey(i, m, d);
+
+          if (scheduleIsValidToday(m, d) && !m.takenToday &&
+              d.hour() == m.hr && d.minute() == m.mn &&
+              lastTriggeredKey[i] != alarmKey) {
 
           Serial.printf("[ALARM] %s at %02d:%02d | %s MEAL | color=%s\n",
                         m.name, m.hr, m.mn, m.mealTiming, m.color);
+
+          // IMPORTANT: lock this alarm BEFORE changing state.
+          // The lock survives Firebase re-syncs during the same minute.
+          lastTriggeredKey[i] = alarmKey;
+          Serial.printf("[ALARM] Trigger lock set: %s\n", alarmKey.c_str());
 
           activeIdx = i;
           rgbColor(m.color);
@@ -1038,6 +1528,7 @@ void loop() {
           state = S_REMINDER;
           break;
         }
+      }
       }
       break;
     }
@@ -1081,10 +1572,6 @@ void loop() {
         closeComp(m.comp);
 
         logEvent("Medicine Taken", m.name, 0.0f);
-
-        prefs.begin("hm", false);
-        prefs.putBytes("meds", meds, sizeof(meds));
-        prefs.end();
 
         startWaterTracking();
         screenMsg("Medicine Taken!");
