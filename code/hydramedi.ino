@@ -31,7 +31,6 @@ const char* FIREBASE_URL = "https://hydramedi-default-rtdb.firebaseio.com";
 
 #define PIN_BUZZER 14
 #define PIN_BUTTON 13
-#define PIN_POWER_BUTTON 16   // Project ON/OFF button (button to GND)
 #define PIN_SERVO1 18
 #define PIN_SERVO2 19
 #define PIN_SERVO3 23
@@ -56,7 +55,6 @@ const char* FIREBASE_URL = "https://hydramedi-default-rtdb.firebaseio.com";
 #define WATER_DISPLAY_MS 250UL
 #define FIREBASE_SYNC_MS 20000UL
 #define DEBOUNCE_MS 200UL
-#define POWER_BUTTON_DEBOUNCE_MS 300UL
 
 // HX711 calibration - keep your existing value initially, then recalibrate
 #define HX711_CALIBRATION -5.214126f
@@ -165,17 +163,6 @@ unsigned long tBtn = 0;
 
 bool buzzing = false;
 String lastDate = "";
-
-// -----------------------------------------------------------------------
-// PROJECT ON/OFF CONTROL
-// -----------------------------------------------------------------------
-// This is a SOFTWARE power switch. It does not remove electrical power
-// from the ESP32; it puts HydraMedi into a safe OFF state and disables
-// Firebase scheduling/actuators until the button is pressed again.
-bool projectEnabled = true;
-bool powerButtonLastState = HIGH;
-unsigned long tPowerButton = 0;
-unsigned long tPowerDisplay = 0;
 
 // -----------------------------------------------------------------------
 // WEIGHT SENSOR GLOBALS
@@ -624,76 +611,86 @@ void screenFirebaseError() {
   oled.display();
 }
 
-void screenProjectOff() {
-  if (!oledOK) return;
 
+// -----------------------------------------------------------------------
+// STARTUP / LOADING ANIMATION
+// -----------------------------------------------------------------------
+void startupText(const String& title, const String& sub, int progress) {
+  if (!oledOK) return;
   oled.clearDisplay();
   oled.setTextColor(SSD1306_WHITE);
-  oled.setTextSize(2);
-  oled.setCursor(34, 8);
-  oled.print("OFF");
   oled.setTextSize(1);
-  oled.setCursor(12, 32);
-  oled.print("HydraMedi stopped");
-  oled.setCursor(7, 46);
-  oled.print("Press Power button");
-  oled.setCursor(27, 56);
-  oled.print("to turn ON");
+  oled.setCursor(32, 0);
+  oled.print("HydraMedi");
+  oled.drawLine(0, 10, 128, 10, SSD1306_WHITE);
+  oled.setTextSize(2);
+  oled.setCursor(8, 18);
+  oled.print(title);
+  oled.setTextSize(1);
+  oled.setCursor(8, 40);
+  oled.print(sub);
+  oled.drawRect(8, 52, 112, 8, SSD1306_WHITE);
+  int w = constrain(progress, 0, 100) * 108 / 100;
+  if (w > 0) oled.fillRect(10, 54, w, 4, SSD1306_WHITE);
   oled.display();
 }
 
-void forceProjectOutputsOff() {
-  digitalWrite(PIN_BUZZER, LOW);
-  buzzing = false;
-  rgbOff();
-  timingLEDsOff();
-}
+void startupAnimation() {
+  Serial.println("[STARTUP] HydraMedi loading animation...");
 
-void handlePowerButton() {
-  bool current = digitalRead(PIN_POWER_BUTTON);
-
-  // Detect a new press (HIGH -> LOW), not a held button.
-  if (current == LOW && powerButtonLastState == HIGH &&
-      millis() - tPowerButton >= POWER_BUTTON_DEBOUNCE_MS) {
-
-    tPowerButton = millis();
-    projectEnabled = !projectEnabled;
-
-    if (!projectEnabled) {
-      Serial.println("[POWER] PROJECT OFF - all alarms, Firebase schedule checks, and actuators disabled.");
-
-      forceProjectOutputsOff();
-      if (activeIdx >= 0 && activeIdx < MAX_MEDS) {
-        closeComp(meds[activeIdx].comp);
-      }
-      state = S_IDLE;
-      activeIdx = -1;
-      baseWeight = 0.0f;
-      displayWeight = 0.0f;
-      bottleLifted = false;
-      bottleWasLifted = false;
-      tDisplay = 0;
-      tLiveSync = millis();
-    } else {
-      Serial.println("[POWER] PROJECT ON - requesting a fresh Firebase schedule sync.");
-
-      forceProjectOutputsOff();
-      state = S_IDLE;
-      activeIdx = -1;
-      tDisplay = 0;
-      tSync = millis();
-
-      // Clear the status until the fresh Firebase read finishes.
-      firebaseStatus = FB_NOT_CHECKED;
-      firebaseError = "";
-      firebaseActiveCount = 0;
-
-      // Firebase is authoritative: immediately try to reload it.
-      syncFB();
+  // Text is revealed serially on OLED.
+  const char* name = "HydraMedi";
+  for (int i = 1; i <= 9; i++) {
+    if (oledOK) {
+      oled.clearDisplay();
+      oled.setTextColor(SSD1306_WHITE);
+      oled.setTextSize(2);
+      oled.setCursor(12, 18);
+      for (int j = 0; j < i; j++) oled.print(name[j]);
+      oled.setTextSize(1);
+      oled.setCursor(34, 40);
+      oled.print("Loading...");
+      oled.display();
     }
+    Serial.print(name[i-1]);
+    delay(120);
   }
+  Serial.println();
 
-  powerButtonLastState = current;
+  // RGB self-test: RED -> GREEN -> BLUE -> OFF.
+  const int rgbMs = 180;
+  Serial.println("[STARTUP] RGB: RED -> GREEN -> BLUE");
+  rgb(1, 0, 0); startupText("RGB", "RED", 25); delay(rgbMs);
+  rgb(0, 1, 0); startupText("RGB", "GREEN", 50); delay(rgbMs);
+  rgb(0, 0, 1); startupText("RGB", "BLUE", 75); delay(rgbMs);
+  rgbOff();
+
+  // Six meal-timing LEDs: each LED ON then OFF in sequence.
+  struct LedStep { int pin; const char* label; };
+  const LedStep steps[] = {
+    {PIN_LED_C1_BEFORE, "C1 BEFORE"},
+    {PIN_LED_C1_AFTER,  "C1 AFTER"},
+    {PIN_LED_C2_BEFORE, "C2 BEFORE"},
+    {PIN_LED_C2_AFTER,  "C2 AFTER"},
+    {PIN_LED_C3_BEFORE, "C3 BEFORE"},
+    {PIN_LED_C3_AFTER,  "C3 AFTER"}
+  };
+
+  Serial.println("[STARTUP] Meal LEDs: each LED ON/OFF sequentially");
+  for (int i = 0; i < 6; i++) {
+    int progress = 78 + (i + 1) * 3;
+    Serial.printf("[STARTUP] %s ON\n", steps[i].label);
+    digitalWrite(steps[i].pin, HIGH);
+    startupText("LED TEST", steps[i].label, progress);
+    delay(180);
+    digitalWrite(steps[i].pin, LOW);
+    delay(100);
+  }
+  timingLEDsOff();
+
+  startupText("HydraMedi", "Hardware Ready", 100);
+  Serial.println("[STARTUP] Animation complete.");
+  delay(350);
 }
 
 void screenMed(const Med& m) {
@@ -1238,7 +1235,7 @@ void syncLiveState() {
 void setup() {
   Serial.begin(115200);
   delay(200);
-  Serial.println("\n\n=== HydraMedi v4.3 Starting ===");
+  Serial.println("\n\n=== HydraMedi v4.4 Starting ===");
 
   // 1. GPIO
   pinMode(PIN_RGB_R, OUTPUT);
@@ -1246,7 +1243,6 @@ void setup() {
   pinMode(PIN_RGB_B, OUTPUT);
   pinMode(PIN_BUZZER, OUTPUT);
   pinMode(PIN_BUTTON, INPUT_PULLUP);
-  pinMode(PIN_POWER_BUTTON, INPUT_PULLUP);
   pinMode(PIN_SERVO1, OUTPUT);
   pinMode(PIN_SERVO2, OUTPUT);
   pinMode(PIN_SERVO3, OUTPUT);
@@ -1262,30 +1258,6 @@ void setup() {
   digitalWrite(PIN_BUZZER, LOW);
   digitalWrite(PIN_HX_CLK, LOW);
   
-  // Servo startup sweep test
-  Serial.println("[SERVO] Testing Servos 1, 2, 3...");
-  openComp(1); delay(400); closeComp(1); delay(200);
-  openComp(2); delay(400); closeComp(2); delay(200);
-  openComp(3); delay(400); closeComp(3); delay(200);
-
-  timingLEDsOff();
-  rgbOff();
-
-  // RGB startup test
-  Serial.printf("[RGB] Type: %s\n", RGB_COMMON_ANODE ? "COMMON ANODE" : "COMMON CATHODE");
-  rgb(1, 0, 0); delay(200);
-  rgb(0, 1, 0); delay(200);
-  rgb(0, 0, 1); delay(200);
-  rgbOff();
-
-  // 6 Timing LEDs startup test
-  digitalWrite(PIN_LED_C1_BEFORE, HIGH); delay(100); digitalWrite(PIN_LED_C1_BEFORE, LOW);
-  digitalWrite(PIN_LED_C1_AFTER,  HIGH); delay(100); digitalWrite(PIN_LED_C1_AFTER,  LOW);
-  digitalWrite(PIN_LED_C2_BEFORE, HIGH); delay(100); digitalWrite(PIN_LED_C2_BEFORE, LOW);
-  digitalWrite(PIN_LED_C2_AFTER,  HIGH); delay(100); digitalWrite(PIN_LED_C2_AFTER,  LOW);
-  digitalWrite(PIN_LED_C3_BEFORE, HIGH); delay(100); digitalWrite(PIN_LED_C3_BEFORE, LOW);
-  digitalWrite(PIN_LED_C3_AFTER,  HIGH); delay(100); digitalWrite(PIN_LED_C3_AFTER,  LOW);
-
   // 2. I2C + OLED
   Wire.begin(PIN_SDA, PIN_SCL);
   delay(50);
@@ -1301,13 +1273,21 @@ void setup() {
     oled.setTextSize(1);
     oled.setTextColor(SSD1306_WHITE);
     oled.setCursor(25, 20);
-    oled.print("HydraMedi v4.3");
+    oled.print("HydraMedi v4.4");
     oled.setCursor(20, 36);
     oled.print("Initializing...");
     oled.display();
   } else {
     Serial.println("[WARN] OLED not found!");
   }
+
+  startupAnimation();
+
+  // Servo startup sweep test
+  Serial.println("[SERVO] Testing Servos 1, 2, 3...");
+  openComp(1); delay(400); closeComp(1); delay(200);
+  openComp(2); delay(400); closeComp(2); delay(200);
+  openComp(3); delay(400); closeComp(3); delay(200);
 
   // 3. RTC
   rtcOK = rtc.begin();
@@ -1407,8 +1387,6 @@ void setup() {
   if (firebaseStatus == FB_ERROR) screenFirebaseError();
   else screenIdle();
 
-  powerButtonLastState = digitalRead(PIN_POWER_BUTTON);
-  tPowerButton = millis();
 }
 
 // -----------------------------------------------------------------------
@@ -1417,25 +1395,6 @@ void setup() {
 void loop() {
   unsigned long ms = millis();
   DateTime d = nowLocal();
-
-  // Hardware ON/OFF button is checked first so it can stop an active
-  // reminder/water state immediately.
-  handlePowerButton();
-
-  if (!projectEnabled) {
-    forceProjectOutputsOff();
-    state = S_IDLE;
-    activeIdx = -1;
-
-    if (oledOK && ms - tPowerDisplay >= 500UL) {
-      tPowerDisplay = ms;
-      screenProjectOff();
-    }
-
-    // Do not fetch Firebase, push LiveState, or run medication logic while OFF.
-    delay(5);
-    return;
-  }
 
   // Always service HX711 whenever a conversion is ready.
   // One conversion only; no 5-sample blocking call.
